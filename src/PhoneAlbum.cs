@@ -117,6 +117,8 @@ namespace PhoneAlbum
         private ToolStrip toolStrip;
         private ToolStripStatusLabel statusLabel;
         private ToolStripStatusLabel statusCount;
+        private ToolStripStatusLabel modeLabel;
+        private ToolStripButton btnSwitchMode;
         private ToolStripProgressBar progressBar;
         private TextBox txtDest;
         private ToolStripButton btnCancel;
@@ -189,7 +191,7 @@ namespace PhoneAlbum
 
             ToolStripButton btnRefresh = new ToolStripButton("刷新清单");
             btnRefresh.DisplayStyle = ToolStripItemDisplayStyle.Text;
-            btnRefresh.Click += delegate { BeginLoadAlbums(); };
+            btnRefresh.Click += delegate { _mtpMode = false; BeginLoadAlbums(); };
 
             btnTransfer = new ToolStripButton("传输所选");
             btnTransfer.DisplayStyle = ToolStripItemDisplayStyle.Text;
@@ -227,6 +229,12 @@ namespace PhoneAlbum
             btnFix.ToolTipText = "手机连不上时点这里，会自动申请管理员权限并修复 ADB 驱动接口";
             btnFix.Click += delegate { RunFixTool(); };
 
+            btnSwitchMode = new ToolStripButton("切换到 ADB 模式");
+            btnSwitchMode.DisplayStyle = ToolStripItemDisplayStyle.Text;
+            btnSwitchMode.ToolTipText = "去手机开启 USB 调试后点这里，无需重启程序";
+            btnSwitchMode.Visible = false;
+            btnSwitchMode.Click += delegate { TrySwitchToAdb(); };
+
             ToolStripButton btnBrowse = new ToolStripButton("...");
             btnBrowse.DisplayStyle = ToolStripItemDisplayStyle.Text;
             btnBrowse.Click += delegate
@@ -250,6 +258,7 @@ namespace PhoneAlbum
             toolStrip.Items.Add(btnOpen);
             toolStrip.Items.Add(new ToolStripSeparator());
             toolStrip.Items.Add(btnFix);
+            toolStrip.Items.Add(btnSwitchMode);
 
             split = new SplitContainer();
             split.Dock = DockStyle.Fill;
@@ -289,16 +298,22 @@ namespace PhoneAlbum
             split.Panel2.Controls.Add(list);
 
             StatusStrip ss = new StatusStrip();
+            ss.ShowItemToolTips = true;
             statusLabel = new ToolStripStatusLabel("正在启动...");
             statusLabel.Spring = true;
             statusLabel.TextAlign = ContentAlignment.MiddleLeft;
             statusCount = new ToolStripStatusLabel("");
+            modeLabel = new ToolStripStatusLabel("● 未连接");
+            modeLabel.ForeColor = System.Drawing.Color.Gray;
+            modeLabel.Font = new Font(Font, FontStyle.Bold);
             progressBar = new ToolStripProgressBar();
             progressBar.Width = 180;
             progressBar.Visible = false;
             ss.Items.Add(statusLabel);
             ss.Items.Add(statusCount);
             ss.Items.Add(progressBar);
+            ss.Items.Add(new ToolStripSeparator());
+            ss.Items.Add(modeLabel);
 
             Controls.Add(split);
             Controls.Add(toolStrip);
@@ -310,7 +325,7 @@ namespace PhoneAlbum
         // ---------- 单文件发行版支持 ----------
         // adb 与 dll 以 GZip 压缩形式嵌进 exe，首次运行时释放到 %LOCALAPPDATA%。
         // 这样用户只需下载一个 exe，不用解压任何东西。
-        private const string AppVersion = "1.2.0";
+        private const string AppVersion = "1.3.0";
 
         static readonly string[][] BundledResources = new string[][] {
             new string[] { "res_adb.gz",       "adb.exe" },
@@ -556,6 +571,7 @@ namespace PhoneAlbum
 
                 UiBuildTree(albums, items);
                 UiMarquee(false);
+                SetModeIndicator(false);
                 UiStatus("清单读取完成，共 " + items.Count + " 个文件。左侧选择相册，右侧勾选后点『传输所选』。");
                 _loading = false;
             }
@@ -726,7 +742,7 @@ namespace PhoneAlbum
 
                 UiBuildTree(albums, items);
                 UiMarquee(false);
-                Text = "手机相册传输 — MTP 模式";
+                SetModeIndicator(true);
                 SetStatus("MTP 模式（无需 USB 调试）：共 " + items.Count + " 个媒体文件。时间列不可用，速度约 28 MB/s。");
                 _loading = false;
                 if (_selfTest) RunSelfTest();
@@ -1012,6 +1028,110 @@ namespace PhoneAlbum
             {
                 MessageBox.Show("启动修复工具失败：\n" + ex.Message, "错误",
                     MessageBoxButtons.OK, MessageBoxIcon.Error);
+            }
+        }
+
+        // ---------- 连接模式指示与切换 ----------
+
+        // 始终在状态栏标明当前走的是 ADB 还是 MTP
+        private void SetModeIndicator(bool mtp)
+        {
+            if (InvokeRequired) { BeginInvoke(new MethodInvoker(delegate { SetModeIndicator(mtp); })); return; }
+
+            _mtpMode = mtp;
+            if (mtp)
+            {
+                modeLabel.Text = "● MTP 模式";
+                modeLabel.ForeColor = Color.FromArgb(200, 110, 0);
+                modeLabel.ToolTipText = "MTP 模式：无需 USB 调试。速度较慢，看不到拍摄时间。点右侧「切换到 ADB 模式」可以升级。";
+                btnSwitchMode.Visible = true;
+                Text = "手机相册传输 — MTP 模式";
+            }
+            else
+            {
+                modeLabel.Text = "● ADB 模式";
+                modeLabel.ForeColor = Color.FromArgb(0, 140, 60);
+                modeLabel.ToolTipText = "ADB 模式：USB 调试已授权。速度更快，拍摄时间准确。";
+                btnSwitchMode.Visible = false;
+                Text = "手机相册传输";
+            }
+            UpdateButtons();
+        }
+
+        private static bool IsAdbDevice(string adbOutput)
+        {
+            return Regex.IsMatch(adbOutput ?? "", @"\sdevice\s*\r?$", RegexOptions.Multiline);
+        }
+
+        // 程序运行中尝试升级到 ADB 模式：用户可以去开 USB 调试，然后回来点重试
+        private void TrySwitchToAdb()
+        {
+            if (_adb == null)
+            {
+                MessageBox.Show("找不到 adb.exe，无法使用 ADB 模式。", "提示",
+                    MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                return;
+            }
+
+            string outTxt = "", errTxt = "";
+            Cursor = Cursors.WaitCursor;
+            try { RunAdb("devices", out outTxt, out errTxt); }
+            catch (Exception ex)
+            {
+                MessageBox.Show("检测失败：" + ex.Message, "错误", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                return;
+            }
+            finally { Cursor = Cursors.Default; }
+
+            if (IsAdbDevice(outTxt))
+            {
+                _cancel = false;
+                SetModeIndicator(false);
+                BeginLoadAlbums();
+                return;
+            }
+
+            string msg = Regex.IsMatch(outTxt ?? "", "unauthorized")
+                ? "手机已连接，但还没授权这台电脑。\n\n请在手机屏幕上点「允许 USB 调试」。\n\n如果手机一直不弹窗，去 开发者选项 → 撤销 USB 调试授权，再重新插线。"
+                : "没有检测到 ADB 设备。请按顺序操作：\n\n" +
+                  "1. 设置 → 关于手机 → 连点「版本号」7 次\n" +
+                  "2. 设置 → 系统和更新 → 开发人员选项\n" +
+                  "3. 打开「USB 调试」开关\n" +
+                  "4. 拔插一次数据线，手机弹窗点「允许」";
+
+            for (int attempt = 0; attempt < 20; attempt++)
+            {
+                DialogResult r = MessageBox.Show(
+                    msg + "\n\n操作完成后点「重试」。",
+                    "切换到 ADB 模式 · 第 " + (attempt + 1) + " 次检测",
+                    MessageBoxButtons.RetryCancel, MessageBoxIcon.Information);
+                if (r != DialogResult.Retry) return;
+
+                Cursor = Cursors.WaitCursor;
+                try { RunAdb("devices", out outTxt, out errTxt); }
+                finally { Cursor = Cursors.Default; }
+
+                if (IsAdbDevice(outTxt))
+                {
+                    _cancel = false;
+                    SetModeIndicator(false);
+                    BeginLoadAlbums();
+                    MessageBox.Show("已切换到 ADB 模式。", "成功", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                    return;
+                }
+
+                if (Regex.IsMatch(outTxt ?? "", "unauthorized"))
+                {
+                    msg = "手机连上了，但还没有授权。\n\n请在手机屏幕上点「允许 USB 调试」。";
+                }
+                else
+                {
+                    msg = "还是没检测到设备。再检查一遍：\n\n" +
+                          "• USB 调试开关真的打开了吗？\n" +
+                          "• 通知栏选的是「传输文件」吗？\n" +
+                          "• 换根数据线试试？（很多线只能充电）\n" +
+                          "• 需要的话点工具栏「修复连接」修驱动";
+                }
             }
         }
 

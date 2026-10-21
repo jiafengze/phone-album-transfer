@@ -24,6 +24,7 @@ layout.txt
 appdata_test/
 download_sim/
 v*_ui.png
+v13_*.png
 selftest_out/
 selftest.txt
 layout.txt
