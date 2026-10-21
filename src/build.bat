@@ -16,9 +16,9 @@ cd /d "%~dp0"
 
 if exist PhoneAlbum.exe del /f PhoneAlbum.exe
 
-"%CSC%" /nologo /target:winexe /optimize+ /win32manifest:app.manifest ^
+"%CSC%" /nologo /target:winexe /optimize+ /codepage:65001 /win32manifest:app.manifest ^
   /out:PhoneAlbum.exe ^
-  /r:System.dll /r:System.Windows.Forms.dll /r:System.Drawing.dll /r:System.Core.dll ^
+  /r:System.dll /r:System.Windows.Forms.dll /r:System.Drawing.dll /r:System.Core.dll /r:Microsoft.CSharp.dll ^
   PhoneAlbum.cs
 
 if exist PhoneAlbum.exe (

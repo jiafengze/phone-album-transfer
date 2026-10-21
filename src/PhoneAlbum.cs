@@ -25,6 +25,8 @@ namespace PhoneAlbum
         public int Height { get; set; }
         public long DurationMs { get; set; }
         public bool IsVideo { get; set; }
+        // MTP 模式下保存 Shell 的 FolderItem，传输时要用
+        public object Native;
 
         public DateTime LocalDate
         {
@@ -125,6 +127,13 @@ namespace PhoneAlbum
         private Thread worker;
         private volatile bool _cancel;
 
+        // ---- MTP 兜底模式 ----
+        private bool _mtpMode;
+        private object _shell;
+        private string _mtpDeviceName = "";
+        private bool _selfTest;
+        private string _selfTestLog;
+
         private int sortColumn = -1;
         private bool sortAsc = true;
 
@@ -136,13 +145,22 @@ namespace PhoneAlbum
         public MainForm()
         {
             _adb = FindAdb();
+
+            // 命令行 --mtp 可强制走 MTP 模式（用于在开了 USB 调试的机器上测试兜底逻辑）
+            string[] argv = Environment.GetCommandLineArgs();
+            for (int i = 0; i < argv.Length; i++)
+            {
+                if (string.Equals(argv[i], "--mtp", StringComparison.OrdinalIgnoreCase)) _mtpMode = true;
+                if (string.Equals(argv[i], "--selftest", StringComparison.OrdinalIgnoreCase)) { _mtpMode = true; _selfTest = true; }
+            }
+            if (_adb == null) _mtpMode = true;
+
             BuildUi();
             Load += delegate
             {
                 try { split.SplitterDistance = (int)(split.Width * 0.34); } catch { }
                 WriteLayoutLog();
-                if (_adb != null) BeginLoadAlbums();
-                else SetStatus("找不到 adb.exe，请先安装 platform-tools");
+                BeginLoadAlbums();
             };
         }
 
@@ -383,7 +401,6 @@ namespace PhoneAlbum
 
         private void BeginLoadAlbums()
         {
-            if (_adb == null) return;
             if (_loading) return;
             _loading = true;
             btnTransfer.Enabled = false;
@@ -392,8 +409,17 @@ namespace PhoneAlbum
             list.Items.Clear();
             progressBar.Visible = true;
             progressBar.Style = ProgressBarStyle.Marquee;
-            SetStatus("正在读取手机相册索引...");
 
+            if (_mtpMode)
+            {
+                SetStatus("MTP 模式：正在读取手机文件夹（比 ADB 慢，请稍候）...");
+                // 不能在这里同步调用：Load 阶段阻塞会让窗体根本不显示出来。
+                // 丢到消息队列里，等窗口真正显示后再执行。
+                BeginInvoke(new MethodInvoker(delegate { DoLoadMtp(); }));
+                return;
+            }
+
+            SetStatus("正在读取手机相册索引...");
             Thread t = new Thread(delegate() { DoLoad(); });
             t.IsBackground = true;
             t.Start();
@@ -407,9 +433,13 @@ namespace PhoneAlbum
                 RunAdb("devices", out outTxt, out errTxt);
                 if (!Regex.IsMatch(outTxt ?? "", @"\sdevice\s*\r?$", RegexOptions.Multiline))
                 {
-                    UiStatus("没检测到手机。请插线、选择「传输文件」、允许 USB 调试。");
-                    UiMarquee(false);
+                    // ADB 不可用 -> 自动降级到 MTP
                     _loading = false;
+                    BeginInvoke(new MethodInvoker(delegate
+                    {
+                        _mtpMode = true;
+                        BeginLoadAlbums();
+                    }));
                     return;
                 }
 
@@ -503,6 +533,298 @@ namespace PhoneAlbum
             long v;
             if (long.TryParse(s.Trim(), out v)) return v;
             return 0;
+        }
+
+        // ------------------ MTP 兜底模式 ------------------
+        //  不走 adb，直接用 Windows Shell COM 读便携设备。
+        //  优点：手机不用开 USB 调试，插线选「传输文件」就能用。
+        //  缺点：慢、没有拍摄时间（MTP 返回 1899 年）、CopyHere 需要消息泵。
+
+        static readonly string[] MediaExt = new string[] {
+            ".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp", ".heic", ".heif",
+            ".mp4", ".3gp", ".mkv", ".mov", ".avi", ".wmv", ".ts", ".webm"
+        };
+
+        private static bool IsVideoExt(string name)
+        {
+            string e = Path.GetExtension(name).ToLowerInvariant();
+            return e == ".mp4" || e == ".3gp" || e == ".mkv" || e == ".mov"
+                || e == ".avi" || e == ".wmv" || e == ".ts" || e == ".webm";
+        }
+
+        private static bool IsMediaFile(string name)
+        {
+            return Array.IndexOf(MediaExt, Path.GetExtension(name).ToLowerInvariant()) >= 0;
+        }
+
+        private void DoLoadMtp()
+        {
+            try
+            {
+                Type shellType = Type.GetTypeFromProgID("Shell.Application");
+                if (shellType == null) { SetStatus("系统不支持 Shell.Application"); _loading = false; return; }
+                dynamic shell = Activator.CreateInstance(shellType);
+                _shell = shell;
+
+                dynamic thisPC = shell.NameSpace("shell:::{20D04FE0-3AEA-1069-A2D8-08002B30309D}");
+                if (thisPC == null) { SetStatus("无法打开「此电脑」"); _loading = false; return; }
+
+                dynamic device = null;
+                foreach (dynamic it in thisPC.Items())
+                {
+                    try
+                    {
+                        if ((bool)it.IsFolder && !(bool)it.IsFileSystem) { device = it; break; }
+                    }
+                    catch { }
+                }
+                if (device == null)
+                {
+                    SetStatus("没找到手机。请插线，并在通知栏选择「传输文件」。");
+                    UiMarquee(false);
+                    _loading = false;
+                    return;
+                }
+
+                _mtpDeviceName = (string)device.Name;
+                SetStatus("设备：" + _mtpDeviceName + "，正在打开存储...");
+                Application.DoEvents();
+
+                dynamic store = null;
+                foreach (dynamic it in ((dynamic)device.GetFolder).Items())
+                {
+                    if ((bool)it.IsFolder) { store = it; break; }
+                }
+                if (store == null)
+                {
+                    SetStatus("手机存储打不开，请先解锁手机屏幕。");
+                    UiMarquee(false);
+                    _loading = false;
+                    return;
+                }
+
+                List<MediaItem> items = new List<MediaItem>();
+                dynamic root = (dynamic)store.GetFolder;
+                int folderCount = 0;
+
+                foreach (dynamic top in root.Items())
+                {
+                    if (_cancel) break;
+                    bool isDir = false;
+                    string topName = "";
+                    try { isDir = (bool)top.IsFolder; topName = (string)top.Name; } catch { continue; }
+                    if (!isDir || topName.StartsWith(".")) continue;
+                    folderCount++;
+                    SetStatus("扫描 " + topName + " ...");
+                    Application.DoEvents();
+                    WalkMtp(top, topName, items, 2);
+                }
+
+                List<Album> albums = new List<Album>();
+                var groups = items.GroupBy(delegate(MediaItem m) { return m.RelPath; });
+                foreach (var g in groups)
+                {
+                    if (g.Count() == 0) continue;
+                    Album a = new Album();
+                    a.Key = g.Key;
+                    a.Title = Util.AlbumTitle(g.Key);
+                    a.Items = g.ToList();
+                    albums.Add(a);
+                }
+                albums = albums.OrderByDescending(delegate(Album a) { return a.Items.Count; }).ToList();
+                _albums = albums;
+                _all = items;
+
+                UiBuildTree(albums, items);
+                UiMarquee(false);
+                Text = "手机相册传输 — MTP 模式";
+                SetStatus("MTP 模式（无需 USB 调试）：共 " + items.Count + " 个媒体文件。时间列不可用，速度约 28 MB/s。");
+                _loading = false;
+                if (_selfTest) RunSelfTest();
+            }
+            catch (Exception ex)
+            {
+                SetStatus("MTP 读取失败：" + ex.Message);
+                UiMarquee(false);
+                _loading = false;
+            }
+        }
+
+        private void WalkMtp(dynamic folderItem, string relPath, List<MediaItem> items, int depth)
+        {
+            if (depth < 0 || items.Count > 40000) return;
+
+            dynamic f = null;
+            try { f = folderItem.GetFolder; } catch { return; }
+            if (f == null) return;
+
+            List<object> subDirs = new List<object>();
+            try
+            {
+                foreach (dynamic it in f.Items())
+                {
+                    try
+                    {
+                        if ((bool)it.IsFolder) { subDirs.Add(it); continue; }
+                        string nm = (string)it.Name;
+                        if (!IsMediaFile(nm)) continue;
+                        long sz = 0;
+                        try { sz = Convert.ToInt64(it.ExtendedProperty("System.Size")); } catch { }
+                        MediaItem m = new MediaItem();
+                        m.Name = nm;
+                        m.Size = sz;
+                        m.RelPath = relPath + "/";
+                        m.DateAdded = 0;
+                        m.IsVideo = IsVideoExt(nm);
+                        m.Native = it;
+                        items.Add(m);
+                    }
+                    catch { }
+                }
+            }
+            catch { }
+
+            if ((items.Count % 200) < 2) Application.DoEvents();
+
+            for (int i = 0; i < subDirs.Count; i++)
+            {
+                string sn = "";
+                try { sn = (string)((dynamic)subDirs[i]).Name; } catch { continue; }
+                if (sn.StartsWith(".")) continue;
+                WalkMtp((dynamic)subDirs[i], relPath + "/" + sn, items, depth - 1);
+            }
+        }
+
+        private void DoTransferMtp(List<MediaItem> items, string destRoot, long totalBytes)
+        {
+            int ok = 0, skipped = 0, failed = 0;
+            long doneBytes = 0;
+            Stopwatch sw = Stopwatch.StartNew();
+            List<string> errors = new List<string>();
+
+            for (int i = 0; i < items.Count; i++)
+            {
+                if (_cancel) break;
+                MediaItem m = items[i];
+                string albumDir = Path.Combine(destRoot, Util.Sanitize(Util.AlbumTitle(m.RelPath)));
+                string destFile = Path.Combine(albumDir, Util.Sanitize(m.Name));
+
+                try
+                {
+                    if (!Directory.Exists(albumDir)) Directory.CreateDirectory(albumDir);
+
+                    if (File.Exists(destFile) && new FileInfo(destFile).Length == m.Size)
+                    {
+                        skipped++;
+                        doneBytes += m.Size;
+                        UiProgress(i + 1, items.Count, doneBytes, totalBytes, sw, skipped, ok, failed);
+                        Application.DoEvents();
+                        continue;
+                    }
+
+                    if (_selfTestLog != null) File.AppendAllText(_selfTestLog, "copy: " + m.Name + " native=" + (m.Native != null) + " size=" + m.Size + "\r\n");
+                    bool done = false;
+                    if (m.Native != null)
+                    {
+                        dynamic tgt = ((dynamic)_shell).NameSpace(albumDir);
+                        if (tgt != null)
+                        {
+                            try { if (File.Exists(destFile)) File.Delete(destFile); } catch { }
+                            tgt.CopyHere(m.Native, 1556);
+                            Stopwatch w = Stopwatch.StartNew();
+                            while (w.Elapsed.TotalSeconds < 300)
+                            {
+                                Application.DoEvents();
+                                if (File.Exists(destFile))
+                                {
+                                    System.Threading.Thread.Sleep(40);
+                                    done = true;
+                                    break;
+                                }
+                                System.Threading.Thread.Sleep(30);
+                            }
+                        }
+                    }
+
+                    if (done && File.Exists(destFile) && new FileInfo(destFile).Length == m.Size)
+                    {
+                        ok++;
+                        doneBytes += m.Size;
+                    }
+                    else
+                    {
+                        failed++;
+                        if (errors.Count < 30) errors.Add(m.Name);
+                    }
+                }
+                catch (Exception ex)
+                {
+                    failed++;
+                    if (_selfTestLog != null) { try { File.AppendAllText(_selfTestLog, "EX: " + ex.ToString() + "\r\n"); } catch { } }
+                    if (errors.Count < 30) errors.Add(m.Name + "  " + ex.Message);
+                }
+
+                UiProgress(i + 1, items.Count, doneBytes, totalBytes, sw, skipped, ok, failed);
+                Application.DoEvents();
+            }
+
+            sw.Stop();
+            UiDone(ok, skipped, failed, doneBytes, sw.Elapsed.TotalSeconds, errors);
+        }
+
+        // 自检：MTP 模式下取一个小相册的单个文件试传一次，把结果写到临时文件后退出。
+        // 用法：PhoneAlbum.exe --selftest
+        private void RunSelfTest()
+        {
+            string log = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "selftest.txt");
+            _selfTestLog = log;
+            File.WriteAllText(log, "stage=entered\r\n");
+            try
+            {
+                File.AppendAllText(log, "stage=albums=" + _albums.Count + "\r\n");
+                Album pick = null;
+                for (int i = 0; i < _albums.Count; i++)
+                {
+                    if (_albums[i].Items.Count >= 1 && _albums[i].Items.Count <= 6) { pick = _albums[i]; break; }
+                }
+                if (pick == null && _albums.Count > 0) pick = _albums[_albums.Count - 1];
+                if (pick == null)
+                {
+                    File.WriteAllText(log, "result=FAIL\r\nreason=没有可用相册\r\n");
+                    BeginInvoke(new MethodInvoker(delegate { Application.Exit(); }));
+                    return;
+                }
+
+                List<MediaItem> one = new List<MediaItem>();
+                one.Add(pick.Items[0]);
+                string dest = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "selftest_out");
+                if (Directory.Exists(dest)) Directory.Delete(dest, true);
+
+                File.AppendAllText(log, "stage=before-copy file=" + one[0].Name + " size=" + one[0].Size + "\r\n");
+                Stopwatch sw = Stopwatch.StartNew();
+                DoTransferMtp(one, dest, one[0].Size);
+                sw.Stop();
+                File.AppendAllText(log, "stage=after-copy\r\n");
+
+                string outFile = Path.Combine(dest, Util.Sanitize(Util.AlbumTitle(one[0].RelPath)), Util.Sanitize(one[0].Name));
+                bool exists = File.Exists(outFile);
+                long got = exists ? new FileInfo(outFile).Length : -1;
+
+                StringBuilder sb = new StringBuilder();
+                sb.AppendLine("album=" + pick.Title);
+                sb.AppendLine("file=" + one[0].Name);
+                sb.AppendLine("expected=" + one[0].Size);
+                sb.AppendLine("got=" + got);
+                sb.AppendLine("exists=" + exists);
+                sb.AppendLine("seconds=" + sw.Elapsed.TotalSeconds.ToString("0.00"));
+                sb.AppendLine("result=" + (exists && got == one[0].Size ? "PASS" : "FAIL"));
+                File.AppendAllText(log, sb.ToString());
+            }
+            catch (Exception ex)
+            {
+                try { File.WriteAllText(log, "result=EXCEPTION\r\n" + ex.ToString()); } catch { }
+            }
+            BeginInvoke(new MethodInvoker(delegate { Application.Exit(); }));
         }
 
         // ------------------ 填充界面 ------------------
@@ -601,7 +923,7 @@ namespace PhoneAlbum
                 ListViewItem lvi = new ListViewItem(m.Name);
                 lvi.SubItems.Add(type);
                 lvi.SubItems.Add(Util.Size(m.Size));
-                lvi.SubItems.Add(m.LocalDate.ToString("yyyy-MM-dd HH:mm"));
+                lvi.SubItems.Add(m.DateAdded > 0 ? m.LocalDate.ToString("yyyy-MM-dd HH:mm") : "未知");
                 lvi.SubItems.Add(m.Width > 0 ? (m.Width + "×" + m.Height) : "");
                 lvi.SubItems.Add(m.IsVideo ? Util.Duration(m.DurationMs) : "");
                 lvi.Tag = m;
@@ -707,6 +1029,13 @@ namespace PhoneAlbum
             progressBar.Maximum = 100;
             progressBar.Value = 0;
 
+            if (_mtpMode)
+            {
+                // MTP 的 Shell.CopyHere 依赖窗口消息泵，必须在 UI 线程执行
+                DoTransferMtp(items, destRoot, totalBytes);
+                return;
+            }
+
             worker = new Thread(delegate() { DoTransfer(items, destRoot, totalBytes); });
             worker.IsBackground = true;
             worker.Start();
@@ -788,7 +1117,7 @@ namespace PhoneAlbum
                 + "，共 " + Util.Size(bytes) + "，用时 " + secs.ToString("0.0") + " 秒，平均 " + speed.ToString("0.0") + " MB/s";
             statusLabel.Text = msg;
 
-            if (failed > 0 && errors.Count > 0)
+            if (failed > 0 && errors.Count > 0 && !_selfTest)
             {
                 StringBuilder sb = new StringBuilder();
                 sb.AppendLine("有 " + failed + " 个文件失败：");

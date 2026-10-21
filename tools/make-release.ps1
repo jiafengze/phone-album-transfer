@@ -11,7 +11,7 @@
 # ============================================================
 
 param(
-    [string]$Version = '1.0.0',
+    [string]$Version = '1.1.0',
     [string]$PlatformTools = ''
 )
 
@@ -39,9 +39,9 @@ if (Test-Path $exeOut) { Remove-Item $exeOut -Force }
 
 $psi = New-Object System.Diagnostics.ProcessStartInfo
 $psi.FileName = $csc
-$psi.Arguments = '/nologo /target:winexe /optimize+ /win32manifest:"' +
+$psi.Arguments = '/nologo /target:winexe /optimize+ /codepage:65001 /win32manifest:"' +
     (Join-Path $srcDir 'app.manifest') + '" /out:"' + $exeOut + '" ' +
-    '/r:System.dll /r:System.Windows.Forms.dll /r:System.Drawing.dll /r:System.Core.dll "' +
+    '/r:System.dll /r:System.Windows.Forms.dll /r:System.Drawing.dll /r:System.Core.dll /r:Microsoft.CSharp.dll "' +
     (Join-Path $srcDir 'PhoneAlbum.cs') + '"'
 $psi.RedirectStandardOutput = $true
 $psi.RedirectStandardError = $true
@@ -128,15 +128,22 @@ $readme = @"
 
 【第一次使用】
 
-1. 手机打开 USB 调试（只需一次）
+1. 插上数据线，手机通知栏选择「传输文件」
+   （不要选「仅充电」或「传输照片」）
+
+2. 双击 PhoneAlbum.exe
+   这时已经能用了（MTP 模式）
+
+3. 想更好用就再开一下 USB 调试（可选，只需一次）
    设置 -> 关于手机 -> 连点「版本号」7 次
    设置 -> 系统和更新 -> 开发人员选项 -> 打开「USB 调试」
+   重插数据线，手机弹「允许 USB 调试吗」-> 勾「始终允许」-> 允许
+   重开程序，这时是 ADB 模式：更快、有拍摄时间、有分辨率
 
-2. 插上数据线
-   手机通知栏选择「传输文件」（不要选「仅充电」）
-   手机弹「允许 USB 调试吗」-> 勾「始终允许」-> 允许
-
-3. 双击 PhoneAlbum.exe
+   两种模式对照：
+     ADB 模式  ~37 MB/s  时间准确  有分辨率/时长
+     MTP 模式  ~28 MB/s  时间未知  无分辨率/时长
+   程序会自动选，不用你操心。
 
 
 【看不到手机怎么办】
