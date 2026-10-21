@@ -222,6 +222,11 @@ namespace PhoneAlbum
             host.AutoSize = false;
             host.Width = (int)(270 * s);
 
+            ToolStripButton btnFix = new ToolStripButton("修复连接");
+            btnFix.DisplayStyle = ToolStripItemDisplayStyle.Text;
+            btnFix.ToolTipText = "手机连不上时点这里，会自动申请管理员权限并修复 ADB 驱动接口";
+            btnFix.Click += delegate { RunFixTool(); };
+
             ToolStripButton btnBrowse = new ToolStripButton("...");
             btnBrowse.DisplayStyle = ToolStripItemDisplayStyle.Text;
             btnBrowse.Click += delegate
@@ -243,6 +248,8 @@ namespace PhoneAlbum
             toolStrip.Items.Add(btnBrowse);
             toolStrip.Items.Add(new ToolStripSeparator());
             toolStrip.Items.Add(btnOpen);
+            toolStrip.Items.Add(new ToolStripSeparator());
+            toolStrip.Items.Add(btnFix);
 
             split = new SplitContainer();
             split.Dock = DockStyle.Fill;
@@ -300,6 +307,84 @@ namespace PhoneAlbum
 
         // ------------------ adb 定位与调用 ------------------
 
+        // ---------- 单文件发行版支持 ----------
+        // adb 与 dll 以 GZip 压缩形式嵌进 exe，首次运行时释放到 %LOCALAPPDATA%。
+        // 这样用户只需下载一个 exe，不用解压任何东西。
+        private const string AppVersion = "1.2.0";
+
+        static readonly string[][] BundledResources = new string[][] {
+            new string[] { "res_adb.gz",       "adb.exe" },
+            new string[] { "res_adbwinapi.gz", "AdbWinApi.dll" },
+            new string[] { "res_adbwinusb.gz", "AdbWinUsbApi.dll" },
+            new string[] { "res_notice.gz",    "NOTICE.txt" },
+            new string[] { "res_fix.gz",       "..\\fix-adb.ps1" }
+        };
+
+        private static string BundleDir()
+        {
+            // PHONEALBUM_DATA 可覆盖数据目录（便携部署 / 测试用）
+            string over = Environment.GetEnvironmentVariable("PHONEALBUM_DATA");
+            if (!string.IsNullOrEmpty(over)) return Path.Combine(over, "platform-tools");
+
+            return Path.Combine(
+                Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+                "PhoneAlbum", "platform-tools");
+        }
+
+        private static string EnsureBundledAdb()
+        {
+            try
+            {
+                System.Reflection.Assembly asm = System.Reflection.Assembly.GetExecutingAssembly();
+                string[] names = asm.GetManifestResourceNames();
+
+                bool hasAny = false;
+                for (int i = 0; i < BundledResources.Length; i++)
+                {
+                    if (Array.IndexOf(names, BundledResources[i][0]) >= 0) { hasAny = true; break; }
+                }
+                if (!hasAny) return null;   // 便携版：platform-tools 就在 exe 旁边
+
+                string dir = BundleDir();
+                string adbPath = Path.Combine(dir, "adb.exe");
+                string marker = Path.Combine(dir, "version.txt");
+
+                string fixScript = Path.Combine(Path.GetDirectoryName(dir), "fix-adb.ps1");
+                bool ready = File.Exists(adbPath) && File.Exists(marker)
+                    && File.Exists(fixScript)
+                    && File.ReadAllText(marker).Trim() == AppVersion;
+                if (ready) return adbPath;
+
+                Directory.CreateDirectory(dir);
+
+                for (int i = 0; i < BundledResources.Length; i++)
+                {
+                    string res = BundledResources[i][0];
+                    string outName = BundledResources[i][1];
+                    using (Stream s = asm.GetManifestResourceStream(res))
+                    {
+                        if (s == null) continue;
+                        string target = Path.Combine(dir, outName);
+                        using (System.IO.Compression.GZipStream gz =
+                            new System.IO.Compression.GZipStream(s, System.IO.Compression.CompressionMode.Decompress))
+                        using (FileStream fs = new FileStream(target, FileMode.Create, FileAccess.Write, FileShare.None))
+                        {
+                            byte[] buf = new byte[81920];
+                            int n;
+                            while ((n = gz.Read(buf, 0, buf.Length)) > 0) fs.Write(buf, 0, n);
+                        }
+                    }
+                }
+
+                File.WriteAllText(marker, AppVersion);
+                return File.Exists(adbPath) ? adbPath : null;
+            }
+            catch
+            {
+                return null;
+            }
+        }
+
         private static string FindAdb()
         {
             // 1) 优先用程序自带的 platform-tools（发行版就是这么打包的）
@@ -314,6 +399,10 @@ namespace PhoneAlbum
             {
                 try { if (File.Exists(bundled[i])) return bundled[i]; } catch { }
             }
+
+            // 2) 单文件发行版：从 exe 内嵌资源释放 adb
+            string extracted = EnsureBundledAdb();
+            if (extracted != null) return extracted;
 
             string cached = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "PhoneAlbum\\adb.path");
             try
@@ -885,6 +974,45 @@ namespace PhoneAlbum
             tree.EndUpdate();
             if (root.Nodes.Count > 0) tree.SelectedNode = root.Nodes[0];
             UpdateButtons();
+        }
+
+        // 手机连不上时的自助修复：释放内置脚本并以管理员权限运行
+        private void RunFixTool()
+        {
+            try
+            {
+                string dir = BundleDir();
+                string script = Path.Combine(Path.GetDirectoryName(dir), "fix-adb.ps1");
+                if (!File.Exists(script))
+                {
+                    MessageBox.Show(
+                        "没找到内置的修复脚本。\n\n请改用 GitHub Releases 里的 zip 版本，\n运行其中的「修复ADB连接.bat」。",
+                        "提示", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                    return;
+                }
+
+                ProcessStartInfo psi = new ProcessStartInfo(
+                    "powershell.exe",
+                    "-NoProfile -ExecutionPolicy Bypass -File \"" + script + "\"");
+                psi.UseShellExecute = true;
+                psi.Verb = "runas";     // 触发 UAC 提权
+
+                Process p = Process.Start(psi);
+                p.WaitForExit();
+
+                if (MessageBox.Show("修复工具已结束。要重新读取手机吗？", "完成",
+                        MessageBoxButtons.YesNo, MessageBoxIcon.Question) == DialogResult.Yes)
+                {
+                    _mtpMode = false;
+                    _cancel = false;
+                    BeginLoadAlbums();
+                }
+            }
+            catch (Exception ex)
+            {
+                MessageBox.Show("启动修复工具失败：\n" + ex.Message, "错误",
+                    MessageBoxButtons.OK, MessageBoxIcon.Error);
+            }
         }
 
         private void WriteLayoutLog()

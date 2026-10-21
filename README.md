@@ -105,21 +105,16 @@ MediaStore 是手机图库自己用的那份媒体索引。读它意味着：
 
 # 四、开始使用（一步步来）
 
-## 第 1 步：下载并解压
+## 第 1 步：下载
 
-到 [Releases](../../releases) 页面下载最新的 `PhoneAlbum-v*-win64.zip`，解压到任意目录。
+到 [Releases](../../releases) 页面下载 `PhoneAlbum-v*-win64.exe`。
 
-> ⚠️ **不要解压到 `C:\Program Files`** 或任何需要管理员权限才能写入的位置。
-> 桌面、D 盘、`文档` 都可以。
+**只有一个文件，双击就能运行。不需要解压，不需要安装。**
 
-解压后应该看到：
+> 首次启动时，程序会自动把内置的 adb 释放到 `%LOCALAPPDATA%\PhoneAlbum\`，
+> 大概需要 1–2 秒，之后每次启动都是秒开。这个过程你完全不用管。
 
-```
-PhoneAlbum.exe        ← 双击这个
-platform-tools\       ← 内置的 adb，不用管
-修复ADB连接.bat       ← 连不上手机时才用
-使用说明.txt
-```
+文件放哪都行——桌面、下载文件夹、D 盘都可以，不会有权限问题。
 
 ## 第 2 步：连接手机
 
@@ -228,7 +223,7 @@ platform-tools\       ← 内置的 adb，不用管
 
 ### 怎么确认真的开成功了
 
-在解压目录的地址栏输入 `cmd` 回车打开命令行，执行：
+在 exe 所在的文件夹，地址栏输入 `cmd` 回车打开命令行，执行：
 
 ```
 platform-tools\adb.exe devices
@@ -248,7 +243,7 @@ XHD0223518002309        device
 | 有设备号 + `device` | ✅ 成功 | 重开程序，自动走 ADB 模式 |
 | 有设备号 + `unauthorized` | 授权没点 | 看手机屏幕，点「允许」 |
 | 有设备号 + `offline` | 连接异常 | 拔插数据线 |
-| **一片空白** | 没连上 | 换线 / 换 USB 口，或跑 `修复ADB连接.bat` |
+| **一片空白** | 没连上 | 换线 / 换 USB 口，或点程序里的「修复连接」 |
 | 命令报"不是内部或外部命令" | 路径写错了 | 确认 `platform-tools` 文件夹就在当前目录下 |
 
 成功后重开 `PhoneAlbum.exe`，**窗口标题会变成「手机相册传输」**（没有 `— MTP 模式` 后缀），状态栏也会显示更精确的统计。
@@ -265,9 +260,13 @@ XHD0223518002309        device
 
 选「仅充电」什么都不给，选「传输照片」只暴露相机目录（DCIM），看不到别的。
 
-## 不要解压到 Program Files
+## 首次启动会慢一两秒
 
-程序运行时会写一个 `layout.txt` 做诊断，且传输需要自由选择目标目录。放在需要管理员权限的位置会出问题。
+单文件版第一次运行时，会把内置的 adb 解压到 `%LOCALAPPDATA%\PhoneAlbum\`。
+这次启动会慢一两秒，之后就正常了。
+
+如果某个安全软件拦截了这个释放动作，程序会提示找不到 adb——
+点工具栏的「修复连接」，或把 `%LOCALAPPDATA%\PhoneAlbum` 加入白名单。
 
 ## 首次读取需要几秒
 
@@ -321,7 +320,7 @@ USB 2.0 手机上（绝大多数机型）：
 
 ### ③ 直接测 adb
 
-打开解压目录，在地址栏输入 `cmd` 回车，然后执行：
+打开 exe 所在的文件夹，在地址栏输入 `cmd` 回车，然后执行：
 
 ```
 platform-tools\adb.exe devices
@@ -331,9 +330,9 @@ platform-tools\adb.exe devices
 - **一片空白** → 往下看 ④
 - **显示 unauthorized** → 手机上点「允许 USB 调试」
 
-### ④ 运行「修复ADB连接.bat」
+### ④ 点程序里的「修复连接」按钮
 
-双击 `修复ADB连接.bat`（会请求管理员权限），它会：
+在程序工具栏最右边有一个「**修复连接**」按钮。点它会弹出 UAC 提权确认（必须允许，因为要改注册表），然后自动：
 
 1. 找出当前插着的 ADB 接口
 2. 补上 Windows 通用驱动缺失的接口 GUID
@@ -384,7 +383,7 @@ MTP 模式不依赖 adb，只要 Windows 能识别手机存储就能工作。
 
 - **C# 5 + WinForms**，用 Windows 自带的 `csc.exe` 编译，**不需要安装 .NET SDK**
 - 运行时依赖 **.NET Framework 4.8**（Windows 10 1903+ 与 Windows 11 均自带）
-- 打包体积 4.24 MB（其中 adb 占 8.1 MB，压缩后约 4 MB）
+- **单文件 4.27 MB**：adb（8.1 MB）+ 两个 dll + NOTICE 用 GZip 压缩后嵌进 exe，首次运行自动释放
 - 数据来源：
   - ADB 模式：`adb shell content query --uri content://media/external/{images,video}/media`
   - MTP 模式：Windows Shell COM 遍历便携设备

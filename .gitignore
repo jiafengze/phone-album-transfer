@@ -19,3 +19,11 @@ desktop.ini
 
 # 本地配置
 layout.txt
+
+# 本地测试产物
+appdata_test/
+download_sim/
+v*_ui.png
+selftest_out/
+selftest.txt
+layout.txt
