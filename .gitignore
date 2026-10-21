@@ -1,0 +1,21 @@
+# 编译产物
+*.exe
+*.pdb
+*.obj
+
+# 打包临时目录
+dist/
+build/
+
+# Visual Studio / VS Code
+.vs/
+*.user
+*.suo
+
+# 系统
+Thumbs.db
+desktop.ini
+.DS_Store
+
+# 本地配置
+layout.txt
